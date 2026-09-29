@@ -1,0 +1,147 @@
+import oci
+import time
+import smtplib
+from email.mime.text import MIMEText
+from email.header import Header
+from email.utils import formataddr
+from datetime import datetime, timedelta
+
+# =========================
+# Параметри пошти (ЗАМІНИТИ на свої)
+# =========================
+FROM_ADDR = 'verelcoin@gmail.com'        # TODO: ваш Gmail
+APP_PASS  = 'hafxbvhgdyiwpmzt'           # TODO: App Password з Google
+TO_ADDR   = 'verelcoin@gmail.com'        # TODO: адреса одержувача
+
+# =========================
+# Функції пошти
+# =========================
+def send_mail(subject, body):
+    """
+    Надіслати email через Gmail SMTP (UTF-8, MIME).
+    """
+    msg = MIMEText(body, _subtype='plain', _charset='utf-8')
+    msg['Subject'] = Header(subject, 'utf-8')
+    msg['From'] = formataddr((str(Header('OCI Bot', 'utf-8')), FROM_ADDR))
+    msg['To'] = TO_ADDR
+
+    with smtplib.SMTP_SSL('smtp.gmail.com', 465) as smtp:
+        smtp.login(FROM_ADDR, APP_PASS)
+        smtp.send_message(msg)
+
+# =========================
+# Планування heartbeat о 10:00
+# =========================
+def next_10am(now=None):
+    """
+    Обчислити наступний момент часу о 10:00 (локальний час сервера).
+    Якщо зараз >= 10:00 — завтра 10:00, інакше — сьогодні 10:00.
+    """
+    if now is None:
+        now = datetime.now()
+    target = now.replace(hour=10, minute=0, second=0, microsecond=0)
+    if now >= target:
+        target += timedelta(days=1)
+    return target
+
+# =========================
+# Основна логіка
+# =========================
+def main():
+    # 1) Стартове сповіщення
+    send_mail(
+        subject="OCI Script Started",
+        body=f"Скрипт стартував на сервері {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+    )
+
+    # 2) Ініціалізація OCI клієнта
+    # Увага: шлях до конфігу має відповідати фактичному розташуванню вашого файлу 'config'
+    # Якщо файл лежить у тій же директорії, залишайте "./config"
+    config = oci.config.from_file(file_location="./config")
+    compute = oci.core.ComputeClient(config)
+
+    # 3) Налаштування щоденного heartbeat о 10:00
+    next_heartbeat = next_10am()
+
+    # 4) Нескінченний цикл спроб створення інстансу з ротацією AD
+    counter = 0
+    while True:
+        # 4.1) Heartbeat перед спробою створення (щоб не пропустити 10:00)
+        now = datetime.now()
+        if now >= next_heartbeat:
+            send_mail(
+                subject="OCI Script Heartbeat",
+                body=f"Скрипт продовжує роботу. Поточний час: {now.strftime('%Y-%m-%d %H:%M:%S')}"
+            )
+            next_heartbeat = next_10am(now + timedelta(seconds=1))
+
+        counter += 1
+        i = counter % 3 + 1
+        availability_domain = "QIpx:EU-FRANKFURT-1-AD-" + str(i)
+        print("try number", counter, "to instance", availability_domain, " ", time.strftime("%H:%M:%S"))
+
+        try:
+            # 4.2) Формування параметрів створення інстансу
+            # ВАЖЛИВО: замініть значення нижче на свої валідні OCID/ключі:
+            # - compartment_id
+            # - subnet_id (у тому ж регіоні)
+            # - metadata['ssh_authorized_keys'] (повний ssh-rsa ключ)
+            # - source_details.image_id (повний OCID образу ARM у eu-frankfurt-1)
+            launch_details = oci.core.models.LaunchInstanceDetails(
+                availability_domain=availability_domain,
+                compartment_id="ocid1.tenancy.oc1..aaaaaaaas4bz6tw7btw6cv6canmmdoqjaryg57jvhr25unjbzkewj2e7dc5q",  # TODO: ваш tenancy OCID
+                shape="VM.Standard.A1.Flex",
+                subnet_id="ocid1.subnet.oc1.eu-frankfurt-1.aaaaaaaaende2lyb4l6skqlww545xrkojn4frzqznz26uwlfxv723r42xgya",  # TODO: ваш subnet OCID
+                metadata={
+                    "ssh_authorized_keys": "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQCYEBFp6SdVW3Nd192SvkABYjn5EFWesHPpSCuJ+LMdBYdQ5NV+4/zpBZjrNkkNvsdItsvoTGyqmQ5yAFXkCT30+5UiMMPe7vBB21hT1u/tgEyKONdm+7NLDhZ12HzAbIxThueHbt5pAqt8Bvb8P+U+WswqlcFeQL+v3tN954DAai3whGQFCp2cmx6qdEar0ssVC9in4eK5Gphe4BbsbzoqVXkEtRTPlKwO6L+8nSiLhHYiV+VWLT4nNtXC/9fkBnMDg5nuCSZ6cEL1s/68j1iI0O/qsgOgN6888joTOspLFsclrb4tRVZfpJ81icQygyyawP/mlETFb+P1wTp+4ZiN ssh-key-2022-09-11"  # TODO: ваш публічний SSH ключ
+                },
+                create_vnic_details=oci.core.models.CreateVnicDetails(
+                    assign_public_ip=True,
+                    assign_private_dns_record=True,
+                    subnet_id="ocid1.subnet.oc1.eu-frankfurt-1.aaaaaaaaende2lyb4l6skqlww545xrkojn4frzqznz26uwlfxv723r42xgya"  # дублюємо той самий subnet_id
+                ),
+                shape_config=oci.core.models.LaunchInstanceShapeConfigDetails(
+                    ocpus=2,           # за потреби змініть (1..4 в межах Free)
+                    memory_in_gbs=12   # відповідно до обраних OCPU (max 24 на акаунт)
+                ),
+                source_details=oci.core.models.InstanceSourceViaImageDetails(
+                    source_type="image",
+                    image_id="ocid1.image.oc1.eu-frankfurt-1.aaaaaaaayzffg7joutsd6qycri5afufkdfwfmbm7xevydkyvmm6tavmve6eq"  # TODO: повний валідний OCID образу ARM
+                ),
+                display_name="ubuntu_22.04"
+            )
+
+            response = compute.launch_instance(launch_instance_details=launch_details)
+            instance_id = response.data.id
+
+            # 4.3) Очікування стану RUNNING з heartbeat усередині
+            while True:
+                # перевірка heartbeat, щоб не пропустити 10:00
+                now = datetime.now()
+                if now >= next_heartbeat:
+                    send_mail(
+                        subject="OCI Script Heartbeat",
+                        body=f"Скрипт продовжує роботу. Поточний час: {now.strftime('%Y-%m-%d %H:%M:%S')}"
+                    )
+                    next_heartbeat = next_10am(now + timedelta(seconds=1))
+
+                instance = compute.get_instance(instance_id).data
+                if instance.lifecycle_state == "RUNNING":
+                    print(f"Instance {instance_id} is running!")
+                    # 2) Сповіщення про успішний запуск інстансу
+                    send_mail(
+                        subject="OCI Instance Created",
+                        body=f"Новий інстанс {instance_id} (A1) RUNNING у {availability_domain} {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}."
+                    )
+                    return
+
+                print(f"Awaiting: current state = {instance.lifecycle_state}")
+                time.sleep(30)
+
+        except Exception as e:
+            # За вашою вимогою: без нотифікацій про помилки — лише лог у консоль
+            print("Error:", getattr(e, 'message', str(e)))
+            time.sleep(45)
+
+if __name__ == "__main__":
+    main()
